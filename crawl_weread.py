@@ -731,15 +731,28 @@ async def verify_arrived(page, target_title):
 async def navigate_to_catalog_item(page, nav_idx, retries=4):
     """
     健壮导航至目录第 nav_idx 项：
-    目录面板可能自动收起或虚拟列表重渲染导致元素脱离 DOM，这里每次失败都会
-    重新打开面板、重新定位元素再点击，最多重试 retries 次。
-    返回是否成功。
+    目录面板可能已收起（元素仍在 DOM 中但不可见）、阅读器 UI 可能因点击中央
+    而被隐藏、虚拟列表可能重渲染——每次失败都会恢复 UI、按可见性重新打开面板、
+    重新定位元素再点击，最多重试 retries 次。返回是否成功。
     """
     for attempt in range(retries):
         try:
-            # 确保目录面板处于打开状态
-            if await page.locator(".readerCatalog_list_item").count() == 0:
-                await page.click("button.readerControls_item.catalog", timeout=5000)
+            # 按"可见性"判断面板是否打开（count() 无法区分收起状态）
+            try:
+                panel_open = await page.locator(".readerCatalog_list_item").first.is_visible()
+            except Exception:
+                panel_open = False
+            if not panel_open:
+                # 点击中央恢复可能被隐藏的阅读器 UI，再打开目录面板
+                try:
+                    await page.mouse.click(600, 450)
+                except Exception:
+                    pass
+                try:
+                    await page.click("button.readerControls_item.catalog", timeout=5000)
+                except Exception:
+                    await page.keyboard.press("Escape")
+                    await page.mouse.click(600, 450)
                 await asyncio.sleep(1.5)
             it = page.locator(".readerCatalog_list_item").nth(nav_idx)
             await it.wait_for(state="visible", timeout=5000)
@@ -751,6 +764,10 @@ async def navigate_to_catalog_item(page, nav_idx, retries=4):
             print(f"  ⚠️ 目录导航失败 ({attempt + 1}/{retries}): {str(e)[:80]}", flush=True)
             try:
                 await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            try:
+                await page.mouse.click(600, 450)
             except Exception:
                 pass
             await asyncio.sleep(1.5)
@@ -1094,12 +1111,12 @@ async def main(book_id_or_url, force=False, profile=DEFAULT_PROFILE):
                 print(f"  🔙 卷首回补完成: {len(front_records)} 页已落盘（页码 0~{len(front_records) - 1}）", flush=True)
             else:
                 print("  🔙 卷首无额外页面，无需回补", flush=True)
-            # 重新导航回目录第一项，从那里开始正常向前抓取（避免重复遍历已回补页面）
+            # 重新导航回目录第一项，从那里开始正常向前抓取（避免重复遍历已回补页面）。
+            # 若导航失败不终止：此时阅读器就在封面/扉页附近，直接从当前位置向前抓是安全的
+            # （已回补页面的签名已登记，重走会被去重；章节由目录前向扫描自动纠正）。
             nav_ok = await navigate_to_catalog_item(page, nav_idx)
             if not nav_ok:
-                print("❌ 回补后重新导航失败，任务终止。")
-                await ctx.close()
-                return False
+                print("⚠️ 回补后重新导航失败，直接从当前位置继续向前抓取（目录匹配会自动纠正）。", flush=True)
             await asyncio.sleep(1.0)
             try:
                 if await page.locator(".readerCatalog_list_item").first.is_visible():
