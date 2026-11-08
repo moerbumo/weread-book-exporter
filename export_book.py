@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""WeRead Multi-Format Book Exporter (export_book.py)
+"""WeRead Book Exporter (export_book.py)
 
-将已抓取的书籍章节一键导出为：
-1. 纯 Markdown 笔记版 (.md)：引用块格式，适配 Obsidian / Notion / Logseq
-2. HTML 样式版 Markdown (.md)：保留精细排版语义标签
-3. 标准 EPUB 电子书 (.epub)：双字体 CSS 排版，内嵌目录树与原书高清配图
-4. 大字号出版级精排 PDF (.pdf)：跨平台字体栈（Mac/Win/Linux），带封面、可点击目录、侧边栏书签大纲与页码
+将已抓取的书籍章节导出为 Obsidian 知识库友好的 Markdown 结构：
+1. 每章一个 .md 文件（含 YAML frontmatter，纯 Markdown 语法，无 HTML 排版标签）
+2. 一本书一个文件夹：章节文件 + 「_目录」索引（wikilink 双链跳转）+ images/ 插图文件夹
+3. 可选：标准 EPUB 电子书 (.epub) 与大字号精排 PDF (.pdf)（--epub / --pdf 开关）
+
+章节文件直接整体复制进 Obsidian 仓库即可使用。
 """
 import asyncio
 import base64
@@ -13,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 
 from playwright.async_api import async_playwright
@@ -42,6 +44,15 @@ def extract_book_id(raw_input):
         return m_id.group(0)
     clean = re.sub(r"^https?://[^/]+/", "", text).split("?")[0].strip("/")
     return clean or text
+
+
+def sanitize_filename(name, max_len=60):
+    """去除文件名非法字符（Windows/macOS/Linux 通用）"""
+    name = re.sub(r'[<>:"/\\|?*\r\n\t]+', "_", name or "")
+    name = name.strip().strip(".").strip()
+    if len(name) > max_len:
+        name = name[:max_len].rstrip()
+    return name or "untitled"
 
 
 def refine_chapter_text(text):
@@ -117,7 +128,6 @@ def refine_chapter_text(text):
 def read_book(book_id):
     root = os.path.join(BASE, "output", book_id + "_v2")
     ch_dir = os.path.join(root, "chapters")
-    head_dir = os.path.join(root, "_head")
     raw_dir = os.path.join(root, "raw")
 
     # 🌟 断点数据自愈重构：若 chapters 目录为空但 raw 存在逐页落盘记录，自动恢复所有章节
@@ -133,13 +143,6 @@ def read_book(book_id):
             except Exception as e:
                 print(f"⚠️ 自动重构章节提示: {e}")
 
-    heads = []
-    if os.path.isdir(head_dir):
-        for fn in sorted(os.listdir(head_dir)):
-            if fn.endswith(".md"):
-                with open(os.path.join(head_dir, fn), encoding="utf-8") as f:
-                    heads.append(f.read())
-
     seen_hash = set()
     chaps = []
     if os.path.isdir(ch_dir):
@@ -154,31 +157,77 @@ def read_book(book_id):
                 continue
             seen_hash.add(h)
             chaps.append(text)
-    return root, heads + chaps
+    return root, chaps
 
 
-def build_markdown_files(book_id, title, texts):
-    out_dir = os.path.join(BASE, "output")
-    os.makedirs(out_dir, exist_ok=True)
-    refined = [refine_chapter_text(t) for t in texts]
+def _yaml_str(s):
+    return (s or "").replace('"', "'").replace("\n", " ")
 
-    safe_title = re.sub(r'[<>:"/\\|?*]', "_", title) or book_id
-    html_md_path = os.path.join(out_dir, f"{safe_title}_全书合并_HTML排版版.md")
-    with open(html_md_path, "w", encoding="utf-8") as f:
-        f.write("\n\n---\n\n".join(refined))
 
-    pure_chaps = []
-    for t in refined:
-        t = re.sub(r'<p class="yw">(.*?)</p>', r'> **\1**', t)
-        t = re.sub(r'<p class="fang">(.*?)</p>', r'> *\1*', t)
-        pure_chaps.append(t)
+def build_obsidian_markdown(book_id, root, title, author, texts):
+    """生成 Obsidian 知识库友好结构：每章一个 .md + 目录索引 + images/ 插图文件夹"""
+    safe_title = sanitize_filename(title) or book_id
+    out_dir = os.path.join(BASE, "output", safe_title)
+    img_out = os.path.join(out_dir, "images")
+    os.makedirs(img_out, exist_ok=True)
 
-    pure_md_path = os.path.join(out_dir, f"{safe_title}_纯Markdown笔记版.md")
-    with open(pure_md_path, "w", encoding="utf-8") as f:
-        f.write("\n\n---\n\n".join(pure_chaps))
+    # 1. 复制插图到书籍文件夹（章节内 ![](images/xxx.jpg) 相对路径即可正确显示）
+    copied = 0
+    src_img_dir = os.path.join(root, "images")
+    if os.path.isdir(src_img_dir):
+        for fn in sorted(os.listdir(src_img_dir)):
+            fp = os.path.join(src_img_dir, fn)
+            if os.path.isfile(fp) and os.path.getsize(fp) > 100:
+                shutil.copy2(fp, os.path.join(img_out, fn))
+                copied += 1
 
-    print(f"📄 Markdown 笔记生成完成:\n  - {pure_md_path}", flush=True)
-    return pure_md_path
+    # 2. 逐章生成纯 Markdown 章节文件（含 YAML frontmatter）
+    chapter_files = []
+    for i, text in enumerate(texts, 1):
+        text = refine_chapter_text(text)
+        # 转为纯 Markdown 语法：引文 → 引用块，重点段落 → 斜体引用块
+        text = re.sub(r'<p class="yw">(.*?)</p>', r'> **\1**', text)
+        text = re.sub(r'<p class="fang">(.*?)</p>', r'> *\1*', text)
+        first = text.split("\n", 1)[0]
+        ch_title = re.sub(r"^#\s*", "", first).strip() or f"第{i}节"
+        fname = f"{i:03d} {sanitize_filename(ch_title)}.md"
+        fm = (
+            "---\n"
+            f'title: "{_yaml_str(ch_title)}"\n'
+            f'book: "{_yaml_str(title)}"\n'
+            f'author: "{_yaml_str(author)}"\n'
+            f"chapter: {i}\n"
+            "tags:\n"
+            "  - weread\n"
+            "---\n\n"
+        )
+        with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
+            f.write(fm + text)
+        chapter_files.append(fname)
+
+    # 3. 目录索引（wikilink 双链跳转）
+    lines = [
+        "---",
+        f'title: "{_yaml_str(title)}"',
+        f'author: "{_yaml_str(author)}"',
+        "type: book-index",
+        "tags:",
+        "  - weread",
+        "---",
+        "",
+        f"# {title}",
+        "",
+        f"共 {len(chapter_files)} 章",
+        "",
+    ]
+    for fname in chapter_files:
+        lines.append(f"- [[{fname[:-3]}]]")
+    index_path = os.path.join(out_dir, f"_目录 {safe_title}.md")
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print(f"📄 Obsidian Markdown 章节文件生成完成: {out_dir} ({len(chapter_files)} 章, {copied} 张插图)", flush=True)
+    return out_dir
 
 
 def build_epub(book_id, root, title, author, texts):
@@ -199,6 +248,7 @@ def build_epub(book_id, root, title, author, texts):
     css_text = """
     body { font-family: "Songti SC", "SimSun", "Noto Serif CJK SC", serif; line-height: 1.85; font-size: 1em; margin: 0.6em 0.8em; }
     h1 { font-size: 1.35em; margin: 1.2em 0 0.9em; text-align: center; }
+    h2 { font-size: 1.12em; margin: 1em 0 0.45em; color: #7c2d12; border-left: 3px solid #9e2a2b; padding-left: 0.4em; }
     p { text-indent: 2em; margin: 0.55em 0; }
     p.yw { font-family: "Kaiti SC", "KaiTi", "STKaiti", "楷体", serif; font-size: 1.05em; text-indent: 0; margin: 0.9em 0; padding: 0.5em 0.75em; border-left: 3px solid #9e2a2b; background-color: #f7f5ef; }
     p.fang { font-family: "Kaiti SC", "KaiTi", "STKaiti", "楷体", serif; font-weight: bold; text-indent: 0; margin: 0.45em 0 0.45em 1.2em; }
@@ -235,7 +285,7 @@ def build_epub(book_id, root, title, author, texts):
     book.add_item(epub.EpubNav())
     book.spine = ["nav"] + items
 
-    safe = re.sub(r'[<>:"/\\|?*]', "_", title) or book_id
+    safe = sanitize_filename(title) or book_id
     out_epub = os.path.join(BASE, "output", f"{safe}（双字体精排）.epub")
     epub.write_epub(out_epub, book)
     print(f"📘 EPUB 电子书生成完成: {out_epub}", flush=True)
@@ -270,6 +320,11 @@ def md_to_html_simple(md_text, img_dir):
             uri = img_to_data_uri(os.path.join(img_dir, fn))
             if uri:
                 out.append(f'<div class="img-wrap"><img src="{uri}" alt="{fn}"/></div>')
+            continue
+        m_h = re.match(r"^(#{2,6})\s+(.*)$", line)
+        if m_h:
+            level = min(len(m_h.group(1)), 3)
+            out.append(f'<h{level} class="sub-head">{m_h.group(2)}</h{level}>')
             continue
         if line.startswith('<p class="yw">') and line.endswith("</p>"):
             inner = line[len('<p class="yw">'):-len("</p>")].strip()
@@ -366,6 +421,7 @@ body {{
 .chap-header {{ text-align: center; margin: 2mm 0 8mm 0; page-break-after: avoid; }}
 .chap-idx {{ font-size: 8.5pt; color: #9e2a2b; letter-spacing: 0.22em; font-weight: 700; margin-bottom: 1.5mm; }}
 h1 {{ font-size: 19.5pt; font-weight: 700; color: #18181b; margin: 0 0 3.5mm 0; }}
+h2.sub-head, h3.sub-head {{ text-indent: 0; margin: 1.1em 0 0.5em 0; font-size: 14.5pt; color: #7c2d12; border-left: 3.5px solid #9e2a2b; padding-left: 3mm; page-break-after: avoid; }}
 .chap-rule {{ width: 26mm; height: 2.5px; background: #9e2a2b; margin: 0 auto; border-radius: 2px; }}
 p {{ text-indent: 2em; margin: 0.68em 0; text-align: justify; orphans: 2; widows: 2; }}
 p strong {{ font-weight: 700; color: #111315; }}
@@ -408,7 +464,7 @@ p.yw {{
 </body>
 </html>"""
 
-    safe = re.sub(r'[<>:"/\\|?*]', "_", title) or book_id
+    safe = sanitize_filename(title) or book_id
     html_path = os.path.join(BASE, "output", f"_temp_{book_id}.html")
     pdf_path = os.path.join(BASE, "output", f"{safe}（双字体精排）.pdf")
     with open(html_path, "w", encoding="utf-8") as f:
@@ -443,7 +499,7 @@ p.yw {{
     return pdf_path
 
 
-async def main(book_id_or_url):
+async def main(book_id_or_url, epub=False, pdf=False):
     book_id = extract_book_id(book_id_or_url)
     if not book_id:
         print("❌ 错误: 未提供有效的书籍 ID 或链接")
@@ -464,16 +520,22 @@ async def main(book_id_or_url):
             author = m.get("author", "")
             intro = m.get("intro", "")
 
-    print(f"\n📦 开始导出全格式电子书: 《{title}》")
-    build_markdown_files(book_id, title, texts)
-    build_epub(book_id, root, title, author, texts)
-    await build_pdf(book_id, root, title, author, intro, texts)
-    print(f"\n🎉 恭喜！全格式电子书已生成完毕，保存在: output/ 目录\n")
+    print(f"\n📦 开始导出: 《{title}》")
+    out_dir = build_obsidian_markdown(book_id, root, title, author, texts)
+    if epub:
+        build_epub(book_id, root, title, author, texts)
+    if pdf:
+        await build_pdf(book_id, root, title, author, intro, texts)
+    print(f"\n🎉 导出完成！Obsidian 章节文件夹: {out_dir}")
+    print("   💡 将该文件夹整体复制到 Obsidian 仓库任意位置即可开始阅读与记笔记。\n")
     return True
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python export_book.py <微信读书链接或ID>")
+        print("用法: python export_book.py <微信读书链接或ID> [--epub] [--pdf]")
         sys.exit(1)
-    asyncio.run(main(sys.argv[1]))
+    epub_flag = "--epub" in sys.argv
+    pdf_flag = "--pdf" in sys.argv
+    bid = [a for a in sys.argv[1:] if not a.startswith("-")][0]
+    asyncio.run(main(bid, epub=epub_flag, pdf=pdf_flag))
